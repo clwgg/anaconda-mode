@@ -382,6 +382,7 @@ Apply CALLBACK to the call result when retrieve it.  Remote
 COMMAND must expect four arguments: python buffer content, line
 number position, column number position and file path."
   (let ((url-request-method "POST")
+        (url-request-extra-headers `(("Content-Type" . "application/json")))
         (url-request-data (anaconda-mode-jsonrpc-request command)))
     (url-retrieve
      (format "http://%s:%s" anaconda-mode-localhost-address (anaconda-mode-port))
