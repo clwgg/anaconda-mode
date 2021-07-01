@@ -1,132 +1,39 @@
-
-from __future__ import print_function
-import sys
-import os
-import site
-from distutils.version import LooseVersion
-
-# CLI arguments.
-
-assert len(sys.argv) > 3, 'CLI arguments: %s' % sys.argv
-
-server_directory = sys.argv[-3]
-server_address = sys.argv[-2]
-virtual_environment = sys.argv[-1]
-
-# Ensure directory.
-
-server_directory = os.path.expanduser(server_directory)
-virtual_environment = os.path.expanduser(virtual_environment)
-
-# Installation check.
-
-IS_PY2 = sys.version_info[0] == 2
-
-# jedi versions >= 0.18 don't support Python 2
-if IS_PY2:
-    jedi_dep = ('jedi', '0.17.2')
-    server_directory += '-py2'
-else:
-    jedi_dep = ('jedi', '0.18.0')
-    server_directory += '-py3'
-service_factory_dep = ('service_factory', '0.1.6')
-
-if not os.path.exists(server_directory):
-    os.makedirs(server_directory)
-site.addsitedir(server_directory)
-
-missing_dependencies = []
-
-
-def is_package_dir(path):
-    if os.path.isdir(path):
-        if IS_PY2:
-            return path.endswith(".egg")
-        else:
-            return not (path.endswith(".dist-info") or path.endswith(".egg-info"))
-    return False
-
-def instrument_installation():
-    for package in (jedi_dep, service_factory_dep):
-        package_is_installed = False
-        for path in os.listdir(server_directory):
-            path = os.path.join(server_directory, path)
-            if is_package_dir(path):
-                if path not in sys.path:
-                    sys.path.insert(0, path)
-                if package[0] in path:
-                    package_is_installed = True
-        if not package_is_installed:
-            missing_dependencies.append('=='.join(package))
-
-instrument_installation()
-
-# Installation.
-
-def install_deps_setuptools():
-    import setuptools.command.easy_install
-    cmd = ['--install-dir', server_directory,
-           '--site-dirs', server_directory,
-           '--always-copy', '--always-unzip']
-    cmd.extend(missing_dependencies)
-    setuptools.command.easy_install.main(cmd)
-    instrument_installation()
-
-def install_deps_pip():
-    import subprocess
-    cmd = [sys.executable, '-m', 'pip', 'install', '--target', server_directory]
-    cmd.extend(missing_dependencies)
-    subprocess.check_call(cmd)
-    instrument_installation()
-
-if missing_dependencies:
-    if IS_PY2:
-        install_deps_setuptools()
-    else:
-        install_deps_pip()
-
-del missing_dependencies[:]
-
-try:
-    import jedi
-except ImportError:
-    missing_dependencies.append('=='.join(jedi_dep))
-
-try:
-    import service_factory
-except ImportError:
-    missing_dependencies.append('>='.join(service_factory_dep))
-
-# Try one more time in case if anaconda installation gets broken somehow
-if missing_dependencies:
-    if IS_PY2:
-        install_deps_setuptools()
-    else:
-        install_deps_pip()
-    import jedi
-    import service_factory
-
-# Setup server.
-
-assert LooseVersion(jedi.__version__) >= LooseVersion(jedi_dep[1]), 'Jedi version should be >= %s, current version: %s' % (jedi_dep[1], jedi.__version__)
-
-if virtual_environment:
-    virtual_environment = jedi.create_environment(virtual_environment, safe=False)
-else:
-    virtual_environment = None
-
-# Define JSON-RPC application.
-
+import uvicorn
+import jedi
+import argparse
 import functools
-import threading
+import socket
+from contextlib import closing
+from fastapi import FastAPI
+from fastapi.encoders import jsonable_encoder
+from typing import Optional, List
+from pydantic import BaseModel
 
+class Params(BaseModel):
+    source: str
+    line: int
+    column: int
+    path: Optional[str] = None
+
+class Request(BaseModel):
+    jsonrpc: float
+    id: int
+    method: str
+    params: Params
+
+class Response(BaseModel):
+    jsonrpc: float
+    id: int
+    result: Optional[List] = None
+
+#----- copied and adapted from anaconda-mode script
 def script_method(f):
     @functools.wraps(f)
-    def wrapper(source, line, column, path):
-        timer = threading.Timer(30.0, sys.exit)
-        timer.start()
-        result = f(jedi.Script(source, path=path, environment=virtual_environment), line, column)
-        timer.cancel()
+    def wrapper(request: Request, venv):
+        result = f(jedi.Script(request.params.source,
+                               path=request.params.path,
+                               environment=venv),
+                   request.params.line, request.params.column)
         return result
     return wrapper
 
@@ -187,9 +94,46 @@ def eldoc(script, line, column):
         return [signature.name,
                 signature.index,
                 [param.description[6:] for param in signature.params]]
+#-----
 
-# Run.
+def find_free_port():
+    with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as s:
+        s.bind(('', 0))
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        return s.getsockname()[1]
 
-app = [complete, company_complete, show_doc, infer, goto, get_references, eldoc]
+port = find_free_port()
+print(f"anaconda_mode port {port}")
 
-service_factory.service_factory(app, server_address, 0, 'anaconda_mode port {port}')
+parser = argparse.ArgumentParser()
+parser.add_argument("cachedir")
+parser.add_argument("ip")
+parser.add_argument("venv")
+args = vars(parser.parse_args())
+print(args)
+
+venv = jedi.create_environment(args['venv'], safe=False)
+
+app = FastAPI()
+
+def results_driver(request: Request):
+    methods = dict((method.__name__, method) for method in
+                   [complete, company_complete, show_doc,
+                    infer, goto, get_references, eldoc])
+    method = methods.get(request.method)
+    if method:
+        return method(request, venv)
+
+def handle_request(request: Request):
+    result = results_driver(request)
+    if result:
+        return Response(**request.dict(), result=result)
+    else:
+        return Response(**request.dict())
+
+@app.post("/", response_model=Response)
+async def process_request(request: Request):
+    response = handle_request(request)
+    return jsonable_encoder(response)
+
+uvicorn.run(app, host=args['ip'], port=port)
